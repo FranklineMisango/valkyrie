@@ -33,6 +33,20 @@ replay.vvp: tb_pcap_replay.v $(RTL)
 latency.vvp: tb_capture_latency.v $(RTL)
 	iverilog $(IVFLAGS) -o $@ tb_capture_latency.v $(RTL)
 
+# The real-exchange capture is deliberately NOT in git: it is 199 MB and GitHub
+# rejects any file over 100 MB (GH001), so it can never be pushed as a normal
+# blob. Fail loudly and usefully instead of letting pcap2axis.py trip over a
+# missing file. If $(PCAP) exists, make sees this target as up to date and this
+# recipe never runs.
+$(PCAP):
+	@printf '%s\n' \
+	  "error: $(PCAP) not found." \
+	  "       The capture these gates replay is not stored in git -- it is" \
+	  "       199 MB, and GitHub rejects files larger than 100 MB." \
+	  "       See pcap_data/README.md, or pass your own capture:" \
+	  "         make replay PCAP=/path/to/capture.pcap" >&2
+	@exit 1
+
 $(STIM): FORCE pcap2axis.py $(PCAP)
 	python3 pcap2axis.py $(PCAP) $(STIM) $(LIMIT)
 

@@ -20,5 +20,10 @@ fpga/tb/*.vcd
 fpga/tb/stim.axis
 obj_dir/
 
+# Large test fixture — the 199 MB real-exchange capture. GitHub rejects any file
+# over 100 MB (GH001), so it is not tracked and can never be pushed as a normal
+# blob. Supply it locally; see pcap_data/README.md.
+pcap_data/*.pcap
+
 # macOS
 .DS_Store

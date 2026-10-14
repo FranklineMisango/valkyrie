@@ -48,6 +48,13 @@ Valkyrie is a custom Linux kernel module for **High-Frequency Trading (HFT)** th
 - **38** multicast feed ports (14300-14441 range, ITCH 5.0)
 - **598s** of market data at **2.67 Mbps**
 
+This capture is **not committed**: at 199 MB it exceeds GitHub's 100 MB per-file
+limit, and it is derived test data rather than source. See
+[`pcap_data/README.md`](pcap_data/README.md) for how to supply it, or point the
+harness at any classic-PCAP file with `make rtl-replay PCAP=/path/to/file.pcap`.
+The directed conformance suite (`make test`) and lint (`make rtl-lint`) need no
+capture at all.
+
 ## Measured Performance
 
 Latency is reported as two separate, attributed numbers rather than one figure.

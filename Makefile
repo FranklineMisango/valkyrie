@@ -85,22 +85,34 @@ ci: rtl-test rtl-lint rtl-replay rtl-latency
 PCAP  ?= pcap_data/db-samples.pcap
 LIMIT ?= 2000
 rtl-replay:
-	$(MAKE) -C fpga/tb replay PCAP=$(CURDIR)/$(PCAP) LIMIT=$(LIMIT)
+	$(MAKE) -C fpga/tb replay PCAP=$(abspath $(PCAP)) LIMIT=$(LIMIT)
 
 # Capture latency on real market data: ingress -> ring publish, in core clocks.
 # Asserts that every frame is stamped at arrival and that p99 fits the budget.
 #   make rtl-latency LIMIT=2000 BUDGET=512
 BUDGET ?= 512
 rtl-latency:
-	$(MAKE) -C fpga/tb latency PCAP=$(CURDIR)/$(PCAP) LIMIT=$(LIMIT) BUDGET=$(BUDGET)
+	$(MAKE) -C fpga/tb latency PCAP=$(abspath $(PCAP)) LIMIT=$(LIMIT) BUDGET=$(BUDGET)
 
 # User-space tools (analyzer + simulator) - used by the PCAP replay harness.
 tools:
 	gcc -O2 -Wall -Iinclude -o tools/pcap_analyzer tools/pcap_analyzer.c -lpthread
 	gcc -O2 -Wall -Iinclude -o simulator/valkyrie_sim simulator/valkyrie_sim.c -lpthread
 
+# The capture the replay gates use is NOT in git: it is 199 MB and GitHub rejects
+# any file over 100 MB (GH001). Fail clearly instead of letting the analyzer
+# report a bare open failure.
+$(PCAP):
+	@printf '%s\n' \
+	  "error: $(PCAP) not found." \
+	  "       The real-exchange capture is not stored in git -- it is 199 MB," \
+	  "       and GitHub rejects files larger than 100 MB." \
+	  "       See pcap_data/README.md, or pass your own capture:" \
+	  "         make latency PCAP=/path/to/capture.pcap" >&2
+	@exit 1
+
 # Host-side ITCH decode latency distribution over the same capture.
-latency: tools
+latency: tools $(PCAP)
 	./tools/pcap_analyzer $(PCAP) --latency
 
 test: rtl-test
