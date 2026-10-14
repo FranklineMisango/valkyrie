@@ -1,0 +1,20 @@
+# Valkyrie — Layer 0 + 2: portable test gate (RTL simulation + user-space tools).
+#
+# Runs the same suite as `make ci` / `make rtl-replay` / `make tools`, but on
+# Linux, proving the harness and the tools are portable and giving CI a stable
+# environment. Ubuntu 24.04 ships iverilog 12 and verilator 5.x.
+#
+# Build:  docker build -t valkyrie-test -f docker/Dockerfile.test .
+# Run:    docker run --rm -v "$PWD":/w -w /w valkyrie-test sh docker/run-tests.sh
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential make python3 \
+        iverilog verilator \
+        ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /w

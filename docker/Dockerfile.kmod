@@ -1,0 +1,27 @@
+# Valkyrie — Layer 1: kernel-module compile gate.
+#
+# Builds src/valkyrie_main.c against real Linux kernel headers so the driver is
+# at least known to compile. Containers share the *host* kernel, therefore
+# `uname -r` inside the container names a kernel whose headers do not exist;
+# the build must be pointed at the headers apt actually installed. The root
+# Makefile's `docker-kmod` target does that:
+#
+#   make -C /lib/modules/$(ls /lib/modules | head -1)/build M=$PWD modules
+#
+# Build:  docker build -t valkyrie-kmod -f docker/Dockerfile.kmod .
+# Run:    docker run --rm -v "$PWD":/w -w /w valkyrie-kmod sh -c \
+#           'make KERNELDIR=/lib/modules/$(ls /lib/modules|head -1)/build'
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential make bc bison flex libssl-dev libelf-dev \
+        kmod linux-headers-generic ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /w
+
+# The gate is a compile, not an insmod: vermagic will not match the host
+# kernel, which is expected and irrelevant for a build check.
