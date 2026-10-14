@@ -161,6 +161,14 @@ static int valk_alloc_rings(struct valkyrie_dev *vd)
         vd->descs[i].base_addr = vd->rings[i].dma;
         vd->descs[i].buf_size  = sz;
         vd->descs[i].packet_count = 0;
+        /* Publish the ring to the FPGA using the canonical BAR0 map. */
+        if (vd->bar[0]) {
+            iowrite32(lower_32_bits(vd->rings[i].dma),
+                      vd->bar[0] + VALKYRIE_REG_RING_BASE(i));
+            iowrite32(upper_32_bits(vd->rings[i].dma),
+                      vd->bar[0] + VALKYRIE_REG_RING_BASE(i) + 4);
+            iowrite32((u32)sz, vd->bar[0] + VALKYRIE_REG_RING_SIZE(i));
+        }
         dev_info(&vd->pdev->dev, "Ring %d: DMA=%pad CPU=%p\n",
                  i, &vd->rings[i].dma, vd->rings[i].cpu);
     }
@@ -171,7 +179,7 @@ static int valk_alloc_rings(struct valkyrie_dev *vd)
 static int valk_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
     struct valkyrie_dev *vd;
-    int ret;
+    int ret, i;
 
     vd = kzalloc(sizeof(*vd), GFP_KERNEL);
     if (!vd) return -ENOMEM;
@@ -221,8 +229,21 @@ static int valk_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 err_cdev:    cdev_del(&vd->cdev);
 err_chrdev:  unregister_chrdev_region(vd->dev_num, 1);
-err_rings:   /* cleanup rings */
-err_irq:     /* cleanup irq */
+err_rings:   tasklet_kill(&vd->tasklet);
+             for (i = 0; i < vd->ring_cnt; i++)
+                 if (vd->rings[i].cpu)
+                     dma_free_coherent(&pdev->dev, vd->rings[i].size,
+                                       vd->rings[i].cpu, vd->rings[i].dma);
+err_irq:     if (vd->irqs == 1) free_irq(pdev->irq, vd);
+             else for (i = 0; i < vd->irqs; i++) free_irq(vd->msix[i].vector, vd);
+err_unmap:   for (i = 0; i < VALKYRIE_BAR_COUNT; i++)
+                 if (vd->bar[i]) iounmap(vd->bar[i]);
+err_regions: pci_release_regions(pdev);
+err_disable: pci_disable_device(pdev);
+err_free:    kfree(vd);
+    return ret;
+}
+
 /* ═══ Char ops ═══ */
 static int valk_open(struct inode *inode, struct file *filp)
 {
@@ -246,7 +267,11 @@ static int valk_mmap(struct file *filp, struct vm_area_struct *vma)
     if (idx >= vd->ring_cnt || sz > vd->rings[idx].size) return -EINVAL;
 
     vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+    vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+#else
     vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
+#endif
 
     if (dma_mmap_coherent(&vd->pdev->dev, vma, vd->rings[idx].cpu,
                            vd->rings[idx].dma, sz))
@@ -271,14 +296,32 @@ static long valk_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         return 0;
     }
     case VALKYRIE_IOCTL_START_DMA:
-        if (vd->bar[0]) iowrite32(1, vd->bar[0]);
+        if (vd->bar[0])
+            iowrite32(VALKYRIE_DMA_CTRL_ENABLE,
+                      vd->bar[0] + VALKYRIE_REG_DMA_CTRL);
         dev_info(&vd->pdev->dev, "DMA start\n"); return 0;
     case VALKYRIE_IOCTL_STOP_DMA:
-        if (vd->bar[0]) iowrite32(0, vd->bar[0]);
+        if (vd->bar[0]) iowrite32(0, vd->bar[0] + VALKYRIE_REG_DMA_CTRL);
         dev_info(&vd->pdev->dev, "DMA stop\n"); return 0;
     case VALKYRIE_IOCTL_GET_STATS:
         if (copy_to_user(u, &vd->stats, sizeof(vd->stats))) return -EFAULT;
         return 0;
+    case VALKYRIE_IOCTL_GET_LATENCY: {
+        valkyrie_latency_t lat;
+        if (!vd->bar[0]) return -ENODEV;
+        memset(&lat, 0, sizeof(lat));
+        lat.timestamp_ns = ((__u64)ioread32(vd->bar[0] + VALKYRIE_REG_TS_HI) << 32)
+                         |  (__u64)ioread32(vd->bar[0] + VALKYRIE_REG_TS_LO);
+        lat.last_cycles  = ioread32(vd->bar[0] + VALKYRIE_REG_LAT_LAST);
+        lat.min_cycles   = ioread32(vd->bar[0] + VALKYRIE_REG_LAT_MIN);
+        lat.max_cycles   = ioread32(vd->bar[0] + VALKYRIE_REG_LAT_MAX);
+        lat.packets      = ioread32(vd->bar[0] + VALKYRIE_REG_LAT_PKTS);
+        lat.sum_cycles   = ((__u64)ioread32(vd->bar[0] + VALKYRIE_REG_LAT_SUM_HI) << 32)
+                         |  (__u64)ioread32(vd->bar[0] + VALKYRIE_REG_LAT_SUM_LO);
+        lat.ring_overflows = ioread32(vd->bar[0] + VALKYRIE_REG_RING_OVERFLOW);
+        if (copy_to_user(u, &lat, sizeof(lat))) return -EFAULT;
+        return 0;
+    }
     case VALKYRIE_IOCTL_RESET:
         for (int i = 0; i < vd->ring_cnt; i++) {
             vd->descs[i].head = vd->descs[i].tail = 0;
@@ -296,8 +339,8 @@ static irqreturn_t valk_irq(int irq, void *dev_id)
 {
     struct valkyrie_dev *vd = dev_id;
     if (vd->bar[0]) {
-        uint32_t s = ioread32(vd->bar[0]);
-        iowrite32(s, vd->bar[0]);
+        u32 s = ioread32(vd->bar[0] + VALKYRIE_REG_IRQ_STATUS);
+        iowrite32(s, vd->bar[0] + VALKYRIE_REG_IRQ_STATUS);  /* W1C */
     }
     tasklet_schedule(&vd->tasklet);
     wake_up_interruptible(&vd->wq);
@@ -318,7 +361,11 @@ static void valk_tasklet(unsigned long data)
 static int __init valkyrie_init(void)
 {
     pr_info("Valkyrie DMA v1.0 loading...\n");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    v_class = class_create(VALKYRIE_CLASS_NAME);
+#else
     v_class = class_create(THIS_MODULE, VALKYRIE_CLASS_NAME);
+#endif
     if (IS_ERR(v_class)) return PTR_ERR(v_class);
     int ret = pci_register_driver(&valk_driver);
     if (ret) { class_destroy(v_class); return ret; }
@@ -336,16 +383,14 @@ static void __exit valkyrie_exit(void)
 module_init(valkyrie_init);
 module_exit(valkyrie_exit);
 
-MODULE_LICENSE("MIT");
+/* Dual MIT/GPL: the source is MIT, but the module links GPL-only symbols
+ * (class_create/device_create/pci_ioremap_bar), so modpost requires a
+ * GPL-compatible licence tag. "MIT" alone fails with:
+ *   ERROR: modpost: GPL-incompatible module valkyrie.ko uses GPL-only symbol */
+MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("Frankline Misango Oyolo");
 MODULE_DESCRIPTION("Valkyrie — Ultra-Fast PCIe DMA Module for HFT");
 MODULE_VERSION("1.0.0");
-err_unmap:   /* unmap bars */
-err_regions: pci_release_regions(pdev);
-err_disable: pci_disable_device(pdev);
-err_free:    kfree(vd);
-    return ret;
-}
 
 static void valk_remove(struct pci_dev *pdev)
 {

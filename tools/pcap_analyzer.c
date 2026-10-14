@@ -35,6 +35,38 @@ static uint64_t ns(void) {
  return (uint64_t)ts.tv_sec*1000000000ULL+ts.tv_nsec;
 }
 
+/* ─── Per-packet latency histogram ───
+ * `--latency` used to print a single wall-clock total for the whole file,
+ * which is a throughput number, not a latency: no distribution, no tail.
+ * We now time each packet's parse and report the percentiles an HFT strategy
+ * actually cares about. Packets are timed in batches of 64 so the two
+ * clock_gettime() calls are amortised to well under a nanosecond each.
+ */
+#define LAT_BATCH 64
+#define LAT_BUCKETS 262144          /* 1 ns buckets: 0..262 us + overflow */
+
+static uint32_t lat_hist[LAT_BUCKETS];
+static uint64_t lat_samples = 0, lat_sum = 0, lat_min = 0, lat_max = 0;
+
+static void lat_record(uint64_t v) {
+ if (v >= LAT_BUCKETS) v = LAT_BUCKETS-1;      /* overflow bucket */
+ lat_hist[v]++;
+ lat_samples++;
+ lat_sum += v;
+ if (lat_min == 0 || v < lat_min) lat_min = v;
+ if (v > lat_max) lat_max = v;
+}
+
+static uint64_t lat_pct(double q) {
+ uint64_t target = (uint64_t)(q*(double)lat_samples + 0.5), cum = 0;
+ if (target == 0) target = 1;
+ for (int i = 0; i < LAT_BUCKETS; i++) {
+  cum += lat_hist[i];
+  if (cum >= target) return (uint64_t)i;
+ }
+ return (uint64_t)(LAT_BUCKETS-1);
+}
+
 int main(int argc, char **argv) {
  const char *path=NULL; int v=0,lt=0,st=0,fn=10;
  for (int i=1;i<argc;i++) {
@@ -62,11 +94,13 @@ int main(int argc, char **argv) {
  uint64_t pcnt[256]={0}; uint16_t ports[256]; int np=0;
  uint64_t mc[256]={0}; double fts=0,lts=0;
  uint64_t t0=lt?ns():0;
+ uint64_t pt0=0; int lat_n=0;
  printf("--- First %d ITCH ---\n",fn);
  while(pos+sizeof(pp_t)<=(size_t)fsz) {
   pp_t *ph=(pp_t*)(buf+pos); tot++;
   size_t nxt=pos+sizeof(pp_t)+ph->il;
   if (nxt>(size_t)fsz) break;
+  if (lt && lat_n==0) pt0=ns();
   bytes+=ph->il;
   if (ph->ol>large) large=ph->ol;
   if (ph->il<small) small=ph->il;
@@ -108,8 +142,12 @@ int main(int argc, char **argv) {
     }
    }
   }
+  if (lt) {
+   if (++lat_n == LAT_BATCH) { lat_record((ns()-pt0)/LAT_BATCH); lat_n=0; }
+  }
   pos=nxt;
  }
+ if (lt && lat_n) lat_record((ns()-pt0)/lat_n);     /* partial batch */
  uint64_t t1=lt?ns():0;
  double dur=lts-fts;
  printf("\n=== Summary ===\n");
@@ -121,7 +159,20 @@ int main(int argc, char **argv) {
         (unsigned long long)small,(unsigned long long)large,
         tot?(double)bytes/tot:0);
  if (dur>0) printf("Dur:%.3fs|Rate:%.2fMbps\n",dur,bytes*8.0/dur/1e6);
- if (lt&&t1>t0) printf("Process:%.3fms(%.0fp/s)\n",(t1-t0)/1e6,tot/((t1-t0)/1e9));
+ if (lt&&t1>t0) {
+  printf("\n--- Latency (per packet, averaged over %d-packet windows) ---\n",LAT_BATCH);
+  printf("Samples : %llu windows over %llu packets\n",
+         (unsigned long long)lat_samples,(unsigned long long)tot);
+  if (lat_samples) {
+   printf("Latency : min=%llu p50=%llu p90=%llu p99=%llu max=%llu ns\n",
+          (unsigned long long)lat_min,(unsigned long long)lat_pct(0.50),
+          (unsigned long long)lat_pct(0.90),(unsigned long long)lat_pct(0.99),
+          (unsigned long long)lat_max);
+   printf("Mean    : %.1f ns/packet\n",(double)lat_sum/(double)lat_samples);
+  }
+  printf("Throughput: %.3fms total, %.0f packets/s\n",
+         (t1-t0)/1e6,tot/((t1-t0)/1e9));
+ }
  if (st) {
   printf("\n--- Ports ---\n");
   for (int i=0;i<np-1;i++) for (int j=0;j<np-i-1;j++)
