@@ -1,0 +1,24 @@
+# Build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.cmd
+*.o.cmd
+*.symvers
+*.order
+Module.symvers
+modules.order
+.tmp_versions/
+
+# kbuild command files left in the tree when a build runs inside the repo
+.*.cmd
+
+# RTL simulation artifacts
+fpga/tb/*.vvp
+fpga/tb/*.vcd
+fpga/tb/stim.axis
+obj_dir/
+
+# macOS
+.DS_Store
